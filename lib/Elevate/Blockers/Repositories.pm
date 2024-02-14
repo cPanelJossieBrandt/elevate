@@ -158,14 +158,13 @@ sub _blocker_invalid_yum_repos ($self) {
 }
 
 sub _blocker_unstable_yum ($self) {
-    $self->has_blocker(q[yum is not stable]) unless $self->_yum_is_stable();
+    $self->_yum_is_stable();
 
-    return 0;
+    return;
 }
 
 sub _blocker_system_update ($self) {
-    return 0 if $self->_system_update_check();
-    return $self->has_blocker(q[System is not up to date]);
+    return $self->_system_update_check();
 }
 
 sub _yum_status_hr_contains_blocker ($status_hr) {
@@ -184,6 +183,8 @@ sub _yum_is_stable ($self) {
     if ( $errors =~ m/\S/ms ) {
         ERROR('yum appears to be unstable. Please address this before upgrading');
         ERROR($errors);
+        my $id = ref($self) . '::YumMakeCacheError';
+        $self->has_blocker( Cpanel::JSON::canonical_dump( { 'name' => $id, 'error' => $errors } ), 'blocker_id' => $id, 'quiet' => 1 );
 
         return 0;
     }
@@ -192,11 +193,16 @@ sub _yum_is_stable ($self) {
         my @transactions = grep { m/^transaction-all\./ } readdir $dfh;
         if (@transactions) {
             ERROR('There are unfinished yum transactions remaining. Please address these before upgrading. The tool `yum-complete-transaction` may help you with this task.');
+            my $id = ref($self) . '::YumUnfinishedTransactions';
+            $self->has_blocker( Cpanel::JSON::canonical_dump( { 'name' => $id, 'error' => 'YUM has unfinished transactions.', 'data' => { 'transactions' => \@transactions } } ), 'blocker_id' => $id, 'quiet' => 1 );
             return 0;
         }
     }
     else {
-        ERROR(qq{Could not read directory '/var/lib/yum': $!});
+        my $err = $!;    # Don't want to accidentally lose the error
+        ERROR(qq{Could not read directory '/var/lib/yum': $err});
+        my $id = ref($self) . '::YumDirUnreadable';
+        $self->has_blocker( Cpanel::JSON::canonical_dump( { 'name' => $id, 'error' => $err } ), 'blocker_id' => $id, 'quiet' => 1 );
         return 0;
     }
 
@@ -257,6 +263,23 @@ sub _check_yum_repos ($self) {
                             $current_repo_name, $path
                         )
                     );
+                    my $blocker_id = ref($self) . '::YumInstalledPackagesFromUnsupportedRepository';
+                    $self->has_blocker(
+                        Cpanel::JSON::canonical_dump(
+                            {
+                                'name'  => $blocker_id,
+                                'error' => 'Installed packages are from an unsupported repository.',
+                                'data'  => {
+                                    'repository'          => $current_repo_name,
+                                    'installed_pkg_count' => $total_pkg,
+                                    'repo_path'           => $path,
+                                    'installed_pkgs'      => \@installed_packages,
+                                },
+                            }
+                        ),
+                        'blocker_id' => $blocker_id,
+                        'quiet'      => 1
+                    );
                     push(
                         $self->{_yum_repos_unsupported_with_packages}->@*,
                         {
@@ -277,6 +300,8 @@ sub _check_yum_repos ($self) {
             elsif ( !$current_repo_use_valid_syntax ) {
                 WARN( sprintf( "YUM repo '%s' is using unsupported '\\\$' syntax in %s", $current_repo_name, $path ) );
                 unless ( grep { $_ eq $path } $self->{_yum_repos_path_using_invalid_syntax}->@* ) {
+                    my $blocker_id = ref($self) . '::YumRepoConfigInvalidSyntax';
+                    $self->has_blocker( Cpanel::JSON::canonical_dump( { 'name' => $blocker_id, 'error' => 'YUM repository has unsupported syntax', 'data' => { 'repository' => $current_repo_name, 'path' => $path } } ), 'blocker_id' => $blocker_id, 'quiet' => 1 );
                     push( $self->{_yum_repos_path_using_invalid_syntax}->@*, $path );
                 }
                 $status{'INVALID_SYNTAX'} = 1;
@@ -345,15 +370,35 @@ sub _system_update_check ($self) {
         WARN("Your system is not up to date please run: /usr/bin/yum update");
 
         my $is_blocker;
-        my $output = $out->{stdout} // [];
+        my $output       = $out->{stdout} // [];
+        my $ood_packages = {
+            'outdated_packages_count' => 0,
+            'outdated_packages'       => [],
+            'repositories'            => {},
+        };
         foreach my $line (@$output) {
             next if $line =~ qr{^\s+$};
             next if $line =~ qr{^kernel};    # do not block if we need to update kernel packages
             $is_blocker = 1;
-            last;
+
+            if ( my ( $pkg_name, $pkg_version, $pkg_repo ) = $line =~ qr{^([\w.-]+)\s+([\w.:-]+)\s+([\w-]+)$}x ) {
+                $ood_packages->{'outdated_packages_count'}++;
+                push( @{ $ood_packages->{'outdated_packages'} }, { 'name' => $pkg_name, 'version' => $pkg_version, 'repository' => $pkg_repo } );
+                push( @{ $ood_packages->{'repositories'}->{$pkg_repo}->{'packages'} }, { 'name' => $pkg_name, 'version' => $pkg_version } );
+            }
         }
 
         # not a blocker when only kernels packages need to be updated
+        my $blocker_id = ref($self) . '::YumOutOfDate';
+        $self->has_blocker(
+            Cpanel::JSON::canonical_dump(
+                {
+                    'name'  => $blocker_id,
+                    'error' => 'YUM reports there are out of date packages.',
+                    'data'  => $ood_packages,
+                }
+            )
+        );
         return if $is_blocker;
     }
 

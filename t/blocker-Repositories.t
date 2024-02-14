@@ -26,18 +26,32 @@ my $mock_yum = Test::MockModule->new('Elevate::Blockers::Repositories');
 {
     note "system is up to date.";
 
-    $mock_yum->redefine( _system_update_check => 0 );
+    $mock_yum->redefine( ssystem => 1 );
+    $mock_yum->redefine(
+        ssystem_capture_output => sub {
+
+            # Whitespace is exactly as the system gives us
+            return {
+                'status' => 1,
+                'stdout' => [
+                    'cpanel-sitejet-plugin.noarch                                                                                         1.1.0-7.8.1.cpanel                                                                                         cpanel-plugins',
+                    'ea-apache24-mod_security2.x86_64                                                                                     2.9.7-1.1.38.cpanel                                                                                        EA4-c7',
+                    'rpm-build.x86_64                                                                                                     4.14.3-28.el8_9                                                                                            appstream',
+                ],
+            };
+        }
+    );
+    my $blocked = 0;
+    $mock_yum->redefine( 'has_blocker' => sub { $blocked++ } );
+    $yum->_blocker_system_update();
     is(
-        $yum->_blocker_system_update(),
-        {
-            id  => q[Elevate::Blockers::Repositories::_blocker_system_update],
-            msg => "System is not up to date",
-        },
+        $blocked,
+        1,
         q{Block if the system is not up to date.}
     );
 
     $mock_yum->redefine( _system_update_check => 1 );
-    is( $yum->_blocker_system_update(), 0, 'System is up to date' );
+    is( $yum->_blocker_system_update(), 1, 'System is up to date' );
 
     $mock_yum->unmock('_system_update_check');
 }
